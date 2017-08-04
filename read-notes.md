@@ -124,6 +124,7 @@ SimpleApplicationEventMulticaster.multicastEvent是怎么广播的？
 
 首先，不需要看十个，因为有个这个函数很有用
 getApplicationListeners，可以根据传入的eventtype路由到相关的类去处理，我的天，路由器就是这样。。
+这里有个轮子也是很有用的就是他会解析子类父类的关系
 解析之后只有一下四个：
 class: ConfigFileApplicationListener events: ApplicationEnvironmentPreparedEvent, ApplicationPreparedEvent
 class: LoggingApplicationListener events: ApplicationStartingEvent, ApplicationEnvironmentPreparedEvent, ApplicationPreparedEvent, ContextClosedEvent, ApplicationFailedEvent
@@ -224,16 +225,170 @@ for (String className : WEB_ENVIRONMENT_CLASSES) {
 ```
 很明显这个类就handler这一个event，应该是自己添加properties然后自己处理的典范
 第2个 LoggingApplicationListener 这个我只想说可以读这个类文档，写得很明白，其实还是读取属性触发配置
+这边看自己的配置有没有生效可以看system.getproperty，因为源码上就是通过RelaxedPropertyResolver这个类从配置中读取然后set的，这边为了
+让自己的代码可读性更高可以商用这个类的static方式很厉害
 
+第3个 BackgroundPreinitializer 后台预初始化器（感觉自己可以做这行的英文翻译）
+这个类handle事件的方式是起一个线程去初始化
+```java
+runSafely(new MessageConverterInitializer());
+runSafely(new MBeanFactoryInitializer());
+runSafely(new ValidationInitializer());
+runSafely(new JacksonInitializer());
+runSafely(new ConversionServiceInitializer());
+```
+do you know 什么是safely吗？没错就是戴套
+```java
+public void runSafely(Runnable runnable) {
+    try {
+        runnable.run();
+    }
+    catch (Throwable ex) {
+        // Ignore
+    }
+}
+```
+MessageConverterInitializer这个用于初始化所有可用的httpmessage转换器如：SourceHttpMessageConverter（自带）、Jaxb2RootElement（java xml的）
+Jackson2ObjectMapper（jackson）、gson（google）这些我都用过mapper json to bean可以用后两个，xml的用xpath很爽
+实例化的消息转换器都放到FormHttpMessageConverter.partConverters，并没有后续的作用，只是检查一下吗？
+MBeanFactoryInitializer厉害了整了一个MBeanServer这个可以让你远程查看所有注册过的MBean，厉害了，有点像远程调试
+看看这个玩玩还是可以的http://tuhaitao.iteye.com/blog/786391
+ValidationInitializer这个是看java的validation能不能用的吧，这里开了个线程去做了一些验证性的事情
+JacksonInitializer这个在第一步里已经做了Jackson2ObjectMapperBuilder.json().build()，呵呵
+ConversionServiceInitializer 初始化DefaultFormattingConversionService默认格式转化服务
+第4个 ClasspathLoggingApplicationListener 这个只会在logger.debug==true模式下运行然后就会打log说我在什么classpath下运行，呵呵
+第5个 DelegatingApplicationListener 这个看上去就做了很多事情，因为他是个委托类，可是他这次并没有做什么事因为哈哈，所以用户自己注册的事件都是通过这个代理去做的
+第6个 FileEncodingApplicationListener 看了一眼，这里面做了一件差不多的事情就是get property
 
+到printBanner了，打印自己的旗帜，立一个flag一个小轮子get，也就是之后的代码才是核心，感觉之前的代码除了初始化都是后来加上去的
 
+好的，下面是贯穿始终的ApplicationContext，对应的类是这个
+org.springframework.boot.context.embedded.AnnotationConfigEmbeddedWebApplicationContext
+使用自己的BeanUtils进行初始化，这个也是个有用的轮子
+然后强制转换成ConfigurableApplicationContext
+还要初始化FailureAnalyzer，同样是反射的方式初始化
+applyInitializers，就是把之前的ApplicationContextInitializer全部拿来初始化一遍context，有些在context里面加了很多processor
+没有太多特别的
 
+好的，现在开始下一个事件了contextPrepared这个函数是个空的。。
+然后是打印信息
+```java
+logStartupInfo(context.getParent() == null);
+logStartupProfileInfo(context);
+```
+下面看一下spring的bean怎么注册的DefaultListableBeanFactory
+```java
+private final Map<String, Object> singletonObjects = new ConcurrentHashMap<String, Object>(256);
+```
+就是push到这样一个map中
 
-class: ConfigFileApplicationListener events: ApplicationEnvironmentPreparedEvent, ApplicationPreparedEvent
-class: ConfigFileApplicationListener events: ApplicationEnvironmentPreparedEvent, ApplicationPreparedEvent
-class: ConfigFileApplicationListener events: ApplicationEnvironmentPreparedEvent, ApplicationPreparedEvent
-class: ConfigFileApplicationListener events: ApplicationEnvironmentPreparedEvent, ApplicationPreparedEvent
-class: ConfigFileApplicationListener events: ApplicationEnvironmentPreparedEvent, ApplicationPreparedEvent
-class: ConfigFileApplicationListener events: ApplicationEnvironmentPreparedEvent, ApplicationPreparedEvent
+然后就是把之前传进来的source处理了放到context里面，这边有一个有用的轮子AnnotationUtils
+这里判断传进来的source是不是@Component的，果断是啊，终于把source注册进去了loader.load();这一行代码在SpringApplication里
 
+下一个是contextLoaded事件调用
+这里的处理方式和之前的几个相比多加了对ApplicationContextAware的处理，毕竟context已经loaded了
+处理好这段小逻辑，发出的事件是ApplicationPreparedEvent
+处理的是这三个类，configfile（add了一个post processor）、log（注册了一个bean LOGGING_SYSTEM_BEAN_NAME）、delegate（不处理）监听器
 
+至此context已经load成功了，接下来就是refreshContext了
+做的是AbstractApplicationContext.refresh这个函数，内容略多
+不过都有注释，比较容易懂
+准备重点看一下onRefresh，因为他启动了tomcat，把dispatcherServlet map到/目录，启动了四个filter
+好的，它在这里EmbeddedWebApplicationContext.createEmbeddedServletContainer，在这之前有create theme之类的操作（还有这种操作，不懂）
+先从BeanFactory里面找到之前的
+bean name:tomcatEmbeddedServletContainerFactory class:EmbeddedServletContainerFactory.class
+（这里表示并不知道什么时候塞进去的，以后再找吧）
+有了factory就可以轻松的create一个EmbeddedServletContainer了，这里用的方法是塞入一个匿名初始化类（很好的方式）
+对于dispatcherServlet的mapping也是在这里完成的
+```java
+this.embeddedServletContainer = containerFactory
+					.getEmbeddedServletContainer(getSelfInitializer());
+private org.springframework.boot.web.servlet.ServletContextInitializer getSelfInitializer() {
+    return new ServletContextInitializer() {
+        @Override
+        public void onStartup(ServletContext servletContext) throws ServletException {
+            selfInitialize(servletContext);
+        }
+    };
+}
+```
+再利用之前的environment去设置servletContainer里的参数，很好的设计，参数在environment里，
+然后有一个方法可以设置servletContainer等等的container
+嗯，refresh就结束了
+之后
+registerListeners()
+```java
+protected void registerListeners() {
+    // Register statically specified listeners first.
+    for (ApplicationListener<?> listener : getApplicationListeners()) {
+        getApplicationEventMulticaster().addApplicationListener(listener);
+    }
+
+    // Do not initialize FactoryBeans here: We need to leave all regular beans
+    // uninitialized to let post-processors apply to them!
+    String[] listenerBeanNames = getBeanNamesForType(ApplicationListener.class, true, false);
+    for (String listenerBeanName : listenerBeanNames) {
+        getApplicationEventMulticaster().addApplicationListenerBean(listenerBeanName);
+    }
+
+    // Publish early application events now that we finally have a multicaster...
+    Set<ApplicationEvent> earlyEventsToProcess = this.earlyApplicationEvents;
+    this.earlyApplicationEvents = null;
+    if (earlyEventsToProcess != null) {
+        for (ApplicationEvent earlyEvent : earlyEventsToProcess) {
+            getApplicationEventMulticaster().multicastEvent(earlyEvent);
+        }
+    }
+}
+```
+这里其实是先同步一次listener，之后再广播一次之前的事件
+
+finishBeanFactoryInitialization()
+preInstantiateSingletons这里面会做controller的request mapping和datasource的初始化
+趴了半天终于把做了mapping的bean找出来了
+requestMappingHandlerAdapter
+requestMappingHandlerMapping
+这边信息有点多
+```java
+"main@1" prio=5 tid=0x1 nid=NA runnable
+  java.lang.Thread.State: RUNNABLE
+	  at org.springframework.web.servlet.config.annotation.WebMvcConfigurationSupport.requestMappingHandlerAdapter(WebMvcConfigurationSupport.java:524)
+	  at org.springframework.boot.autoconfigure.web.WebMvcAutoConfiguration$EnableWebMvcConfiguration.requestMappingHandlerAdapter(WebMvcAutoConfiguration.java:376)
+	  at org.springframework.boot.autoconfigure.web.WebMvcAutoConfiguration$EnableWebMvcConfiguration$$EnhancerBySpringCGLIB$$77428afc.CGLIB$requestMappingHandlerAdapter$1(<generated>:-1)
+	  at org.springframework.boot.autoconfigure.web.WebMvcAutoConfiguration$EnableWebMvcConfiguration$$EnhancerBySpringCGLIB$$77428afc$$FastClassBySpringCGLIB$$5daae699.invoke(<generated>:-1)
+	  at org.springframework.cglib.proxy.MethodProxy.invokeSuper(MethodProxy.java:228)
+	  at org.springframework.context.annotation.ConfigurationClassEnhancer$BeanMethodInterceptor.intercept(ConfigurationClassEnhancer.java:358)
+	  at org.springframework.boot.autoconfigure.web.WebMvcAutoConfiguration$EnableWebMvcConfiguration$$EnhancerBySpringCGLIB$$77428afc.requestMappingHandlerAdapter(<generated>:-1)
+	  at sun.reflect.NativeMethodAccessorImpl.invoke0(NativeMethodAccessorImpl.java:-1)
+	  at sun.reflect.NativeMethodAccessorImpl.invoke(NativeMethodAccessorImpl.java:62)
+	  at sun.reflect.DelegatingMethodAccessorImpl.invoke(DelegatingMethodAccessorImpl.java:43)
+	  at java.lang.reflect.Method.invoke(Method.java:498)
+	  at org.springframework.beans.factory.support.SimpleInstantiationStrategy.instantiate(SimpleInstantiationStrategy.java:162)
+	  at org.springframework.beans.factory.support.ConstructorResolver.instantiateUsingFactoryMethod(ConstructorResolver.java:588)
+	  at org.springframework.beans.factory.support.AbstractAutowireCapableBeanFactory.instantiateUsingFactoryMethod(AbstractAutowireCapableBeanFactory.java:1173)
+	  at org.springframework.beans.factory.support.AbstractAutowireCapableBeanFactory.createBeanInstance(AbstractAutowireCapableBeanFactory.java:1067)
+	  at org.springframework.beans.factory.support.AbstractAutowireCapableBeanFactory.doCreateBean(AbstractAutowireCapableBeanFactory.java:513)
+	  at org.springframework.beans.factory.support.AbstractAutowireCapableBeanFactory.createBean(AbstractAutowireCapableBeanFactory.java:483)
+	  at org.springframework.beans.factory.support.AbstractBeanFactory$1.getObject(AbstractBeanFactory.java:306)
+	  at org.springframework.beans.factory.support.DefaultSingletonBeanRegistry.getSingleton(DefaultSingletonBeanRegistry.java:230)
+	  - locked <0x108a> (a java.util.concurrent.ConcurrentHashMap)
+	  at org.springframework.beans.factory.support.AbstractBeanFactory.doGetBean(AbstractBeanFactory.java:302)
+	  at org.springframework.beans.factory.support.AbstractBeanFactory.getBean(AbstractBeanFactory.java:197)
+	  at org.springframework.beans.factory.support.DefaultListableBeanFactory.preInstantiateSingletons(DefaultListableBeanFactory.java:761)
+	  at org.springframework.context.support.AbstractApplicationContext.finishBeanFactoryInitialization(AbstractApplicationContext.java:866)
+	  at org.springframework.context.support.AbstractApplicationContext.refresh(AbstractApplicationContext.java:542)
+	  - locked <0x85f> (a java.lang.Object)
+	  at org.springframework.boot.context.embedded.EmbeddedWebApplicationContext.refresh(EmbeddedWebApplicationContext.java:122)
+	  at org.springframework.boot.SpringApplication.refresh(SpringApplication.java:737)
+	  at org.springframework.boot.SpringApplication.refreshContext(SpringApplication.java:370)
+	  at org.springframework.boot.SpringApplication.run(SpringApplication.java:314)
+	  at org.springframework.boot.SpringApplication.run(SpringApplication.java:1162)
+	  at org.springframework.boot.SpringApplication.run(SpringApplication.java:1151)
+	  at com.pdd.phoenix.Application.main(Application.java:12)
+
+```
+从调试过程分析，preInstantiateSingletons这个函数把所有的bean重新get一遍，中间有些由于某种定义而触发了一些方法的调用，现在就要把它找出来
+又跟踪了很久发现是这个方法干的事情AbstractAutowireCapableBeanFactory.initializeBean
+而在Trigger post-initialization callback for all applicable beans...里面则会将datasource初始化
+
+做完之后会发出ContextRefreshedEvent
